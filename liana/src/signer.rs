@@ -137,6 +137,10 @@ impl HotSigner {
     }
 
     /// Read all the mnemonics from the datadir for the given network.
+    ///
+    /// A file named like the ones written by [`HotSigner::store`] must contain a valid mnemonic.
+    /// Any other entry that does not contain one, such as a `.DS_Store` created by the macOS
+    /// Finder, is ignored.
     pub fn from_datadir(
         datadir_root: &path::Path,
         network: bitcoin::Network,
@@ -146,9 +150,27 @@ impl HotSigner {
         let mnemonic_paths = fs::read_dir(Self::mnemonics_folder(datadir_root, network))
             .map_err(SignerError::MnemonicStorage)?;
         for entry in mnemonic_paths {
-            let mnemonic = fs::read_to_string(entry.map_err(SignerError::MnemonicStorage)?.path())
-                .map_err(SignerError::MnemonicStorage)?;
-            signers.push(Self::from_str(network, &mnemonic)?);
+            let path = entry.map_err(SignerError::MnemonicStorage)?.path();
+            let signer = fs::read_to_string(&path)
+                .map_err(SignerError::MnemonicStorage)
+                .and_then(|mnemonic| Self::from_str(network, &mnemonic));
+            match signer {
+                Ok(signer) => signers.push(signer),
+                Err(e) => {
+                    let named_as_mnemonic = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| MnemonicFileName::from_str(name).is_ok());
+                    if named_as_mnemonic {
+                        return Err(e);
+                    }
+                    log::warn!(
+                        "Ignoring '{}' in the mnemonics folder: {}",
+                        path.display(),
+                        e
+                    );
+                }
+            }
         }
 
         Ok(signers)
@@ -575,6 +597,53 @@ mod tests {
             .map(|signer| signer.words())
             .collect();
         assert_eq!(words_set, words_read);
+
+        fs::remove_dir_all(tmp_dir).unwrap();
+    }
+
+    #[test]
+    fn hot_signer_storage_foreign_files() {
+        let secp = secp256k1::Secp256k1::signing_only();
+        let tmp_dir = tmp_dir();
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let network = bitcoin::Network::Bitcoin;
+
+        let signer = HotSigner::generate(network).unwrap();
+        signer
+            .store(&tmp_dir, network, &secp, Some(("abcdefgh".to_string(), 42)))
+            .unwrap();
+
+        // Files the OS or the user may leave in the folder are ignored.
+        let folder = HotSigner::mnemonics_folder(&tmp_dir, network);
+        fs::write(
+            folder.join(".DS_Store"),
+            [0x00, 0x00, 0x00, 0x01, 0xff, 0xfe],
+        )
+        .unwrap();
+        fs::write(folder.join("desktop.ini"), "[.ShellClassInfo]\r\n").unwrap();
+        fs::write(folder.join("notes.txt"), "").unwrap();
+        fs::create_dir(folder.join("old")).unwrap();
+        let signers = HotSigner::from_datadir(&tmp_dir, network).unwrap();
+        assert_eq!(signers.len(), 1);
+        assert_eq!(signers[0].words(), signer.words());
+
+        // A mnemonic is still read under a name Liana did not write, such as a copy.
+        let copied = HotSigner::generate(network).unwrap();
+        fs::write(folder.join("mnemonic copy.txt"), copied.mnemonic_str()).unwrap();
+        let words_read: HashSet<_> = HotSigner::from_datadir(&tmp_dir, network)
+            .unwrap()
+            .into_iter()
+            .map(|signer| signer.words())
+            .collect();
+        assert_eq!(words_read, HashSet::from([signer.words(), copied.words()]));
+
+        // A file named like a mnemonic file must still hold a valid mnemonic.
+        let fingerprint = HotSigner::generate(network).unwrap().fingerprint(&secp);
+        fs::write(folder.join(format!("mnemonic-{fingerprint}.txt")), "").unwrap();
+        assert!(matches!(
+            HotSigner::from_datadir(&tmp_dir, network),
+            Err(SignerError::Mnemonic(_))
+        ));
 
         fs::remove_dir_all(tmp_dir).unwrap();
     }
