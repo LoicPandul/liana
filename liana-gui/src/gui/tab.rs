@@ -259,6 +259,10 @@ where
                         Some(Ok((app, command))) => (app, command),
                         Some(Err(e)) => {
                             tracing::error!("{}", e);
+                            l.set_error(match e {
+                                SettingsError::Unexpected(e) => login::Error::Unexpected(e),
+                                e => login::Error::Settings(e),
+                            });
                             return Task::none();
                         }
                         None => {
@@ -682,7 +686,7 @@ pub fn create_app_with_remote_backend(
                 )
                 .with_fiat_price_setting(wallet_settings.fiat_price)
                 .load_hotsigners(&liana_dir, network)
-                .expect("Datadir should be conform"),
+                .map_err(|e| SettingsError::Unexpected(e.to_string()))?,
         ),
         config,
         Arc::new(remote_backend),

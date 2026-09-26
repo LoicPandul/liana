@@ -159,6 +159,8 @@ pub enum ConnectionStep {
         backend_api_url: String,
         otp: form::Value<String>,
     },
+    /// Connected, but the wallet could not be opened.
+    Failed,
 }
 
 impl LianaLiteLogin {
@@ -205,6 +207,13 @@ impl LianaLiteLogin {
                 Message::Connected,
             ),
         )
+    }
+
+    /// Show an error that happened once connected, while opening the wallet.
+    pub fn set_error(&mut self, error: Error) {
+        self.processing = false;
+        self.step = ConnectionStep::Failed;
+        self.connection_error = Some(error);
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -414,7 +423,8 @@ impl LianaLiteLogin {
                                         ConnectionStep::WalletDoesNotExist => {
                                             Column::new().push(text(t!("lianalite-wallet-deleted")))
                                         }
-                                        ConnectionStep::CheckingAuthFile => Column::new(),
+                                        ConnectionStep::CheckingAuthFile
+                                        | ConnectionStep::Failed => Column::new(),
                                         ConnectionStep::CheckEmail => Column::new()
                                             .spacing(20)
                                             .align_x(Alignment::Center)
