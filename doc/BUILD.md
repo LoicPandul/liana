@@ -84,8 +84,8 @@ Then run:
 $ cargo build --release
 ```
 The `lianad`, `liana-cli` and `liana-gui` binaries will be in the `target/` directory at the root of the
-repository, except if using Windows in which case only `liana-gui` will be built
-(`lianad` and `liana-cli` relies on Unix socket):
+repository, except if using Windows, where `liana-cli` can't be built (it relies on Unix socket)
+and you need to build only the GUI with `cargo build --release -p liana-gui`:
 ```
 $ ls target/release/
 build  deps  examples  incremental  liana-cli  liana-cli.d  lianad  lianad.d  liana-gui  liana-gui.d  libliana.d  libliana_gui.d  libliana_gui.rlib  libliana.rlib  libliana_ui.d  libliana_ui.rlib
