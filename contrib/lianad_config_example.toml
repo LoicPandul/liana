@@ -1,16 +1,18 @@
-# (Optional) Path to the folder where we should store the application data.
-# Defaults to `.lianad` in your home folder.
+# (Optional) Path to the folder where we should store the application data, in a subfolder named
+# after the network. Defaults to `.liana` in your home folder on Linux, and to a `Liana` folder in
+# the configuration directory on other systems.
 data_dir = "/home/wizardsardine/.lianad"
 
-# How verbose logging should be (one of "error", "warn", "info", "debug", "trace")
+# How verbose logging should be (one of "off", "error", "warn", "info", "debug", "trace")
 log_level = "debug"
 
-# The wallet descriptor. It must be a Segwit v0 Pay-To-Witness-Script-Hash (`wsh()`) descriptor
-# corresponding to a `or(pk(A),and(pk(B),older(X)))` policy (either public key A can spend immediately
+# The wallet descriptor. It must be a Segwit v0 Pay-To-Witness-Script-Hash (`wsh()`) or a Taproot
+# (`tr()`) descriptor with a primary spending path and one or more timelocked recovery paths, such as
+# a `or(pk(A),and(pk(B),older(X)))` policy (either public key A can spend immediately
 # or public key B can spend after X blocks).
 # The public keys must be valid extend keys ("xpubs") ending with a wildcard (i.e. can be derived
-# from). The public keys must be multipath expressions with exactly the `0` and `1` derivation indexes,
-# that is having a derivation step which is `/<0;1>` before the last step. This is in order to be able
+# from). The public keys must be multipath expressions with exactly two derivation indexes,
+# that is having a derivation step such as `/<0;1>` before the last step. This is in order to be able
 # to derive deposit and change addresses from the same descriptor.
 # The extended public keys must be encoded for the network the daemon is to be run (i.e. "xpub"s for the
 # main network and "tpub"s for everything else).
@@ -51,8 +53,8 @@ poll_interval_secs = 30
 # optionally prefixed with "ssl://" or "tcp://". If omitted, "tcp://"
 # will be assumed.
 # `validate_domain` field is optional: used in case of SSL connection,
-# if set to `false`, internal electrum client will not try to validate
-# the domain associated to the certificate: it's useful in case of 
+# if set to `false`, internal electrum client will not verify the server's
+# certificate at all (neither its domain nor its issuer): it's useful in case of
 # self-signed certificate. Its default value is `true`.
 # [electrum_config]
 # addr = "127.0.0.1:50001"
