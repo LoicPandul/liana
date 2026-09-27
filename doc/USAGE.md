@@ -69,8 +69,8 @@ You might have to wait for Bitcoin Core to perform its initial block download. W
 connection to the Bitcoin network is established by using a full node. This means you are fully
 sovereign: you are not trusting a third party to get your onchain data. This does come with a
 drawback: you have to wait for Bitcoin Core to download and validate the historical block chain. But
-fear not! This is just a one time cost. Also, the full node is pruned so it will not use more than
-20GB of disk space.
+fear not! This is just a one time cost. Also, the full node is pruned so it only needs about
+30GB of disk space on mainnet.
 
 #### Using the daemon
 
