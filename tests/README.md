@@ -66,12 +66,9 @@ the `USE_TAPROOT` environment variable to `1`.
 #### Logging
 
 We use the [Live Logging](https://docs.pytest.org/en/latest/logging.html#live-logs)
-functionality from pytest. It is configured in (`pyproject.toml`)[../pyproject.toml] to
-output `INFO`-level to the console. If a test fails, the entire `DEBUG` log is output.
-
-You can override the config at runtime with the `--log-cli-level` option:
+functionality from pytest. Enable it at runtime with the `--log-cli-level` option:
 ```
-pytest -vvv --log-cli-level=DEBUG -k test_startup
+pytest -vvv --log-cli-level=DEBUG -k test_getinfo
 ```
 
 Note that we record all logs from daemons, and we start them with `log_level = "debug"`.
