@@ -59,7 +59,7 @@ This command does not take any parameter for now.
 | Field                | Type            | Description                                                                                  |
 | -------------------- | --------------- | -------------------------------------------------------------------------------------------- |
 | `version`            | string          | Version following the [SimVer](http://www.simver.org/) format                                |
-| `network`            | string          | Answer can be `mainnet`, `testnet`, `regtest`                                                |
+| `network`            | string          | Answer can be `bitcoin`, `testnet`, `testnet4`, `signet`, `regtest`                          |
 | `block_height`       | integer         | The block height we are synced at.                                                           |
 | `sync`               | float           | The synchronization progress as percentage (`0 < sync < 1`)                                  |
 | `descriptors`        | object          | Object with the name of the descriptor as key and the descriptor string as value             |
@@ -220,10 +220,10 @@ A coin may have one of the following four statuses:
 Create a transaction spending one or more of our coins. All coins must exist and not be spent.
 
 If no coins are specified in `outpoints`, they will be selected automatically from the set of
-confirmed coins together with any unconfirmed coins that are change outputs
+confirmed coins together with any unconfirmed coins whose `is_from_self` is `true`
 (see [`listcoins`](#listcoins) for coin status definitions).
 
-Will error if the given coins are not sufficient to cover the transaction cost at 90% (or more) of
+Will error if the given coins are not sufficient to cover the transaction cost at
 the given feerate. If on the contrary the transaction is more than sufficiently funded, it will
 create a change output when economically rationale to do so.
 
@@ -239,7 +239,7 @@ the address of the wallet to sweep the funds to. Note however this output would 
 there is enough remaining funds after sending to the specified destinations. This command WILL NOT
 ERROR if there isn't enough leftover funds to create the change/sweep output.
 
-This command will refuse to create any output worth less than 5k sats.
+This command will refuse to create any output worth less than 500 sats.
 
 #### Request
 
@@ -310,7 +310,7 @@ If `txids` is specified, only list transactions whose `txid` is in `txids`(empty
 | Field          | Type              | Description                                                             |
 | -------------- | ----------------- | ----------------------------------------------------------------------- |
 | `psbt`         | string            | Base64-encoded PSBT of the Spend transaction.                           |
-| `updated_at`   | int or null       | UNIX timestamp of the last time this PSBT was updated.                  |
+| `updated_at`   | int or null       | UNIX timestamp of the first time this PSBT was stored.                  |
 
 
 ### `delspendtx`
@@ -365,7 +365,7 @@ If the transaction pays to more than one of our change addresses, then the one r
 will be used as a change address in the replacement and the others will be treated as non-change outputs
 (i.e. removed for cancel or otherwise kept the same).
 
-If `feerate` is not passed to the command, the target feerate of the replacement will be set to the minimum value
+`feerate` must be passed to bump the fee, and must not be passed to cancel. When cancelling, the target feerate of the replacement will be set to the minimum value
 allowed in order to replace this transaction using RBF (see https://github.com/bitcoin/bitcoin/blob/master/doc/policy/mempool-replacements.md#current-replace-by-fee-policy for further details about this and other conditions that must be satisfied when using RBF).
 
 #### Request
@@ -489,7 +489,7 @@ overrides the previous one. If a `null` value is passed, the label is deleted.
 
 | Field    | Type   | Description                                                                                                           |
 | -------- | ------ | --------------------------------------------------------------------------------------------------------------------- |
-| `labels` | object | A mapping from an item to be labelled (an address, a txid or an outpoint) to a label string (at most 100 chars long). |
+| `labels` | object | A mapping from an item to be labelled (an address, a txid or an outpoint) to a label string (at most 100 bytes long). |
 
 ### `getlabels`
 
