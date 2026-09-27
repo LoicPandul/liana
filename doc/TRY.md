@@ -54,7 +54,7 @@ Get the Liana software for your system on the [Wizardsardine website](https://wi
 
 A note for **Linux users only**: released binaries may not be working on your system if it is
 running a too old glibc. In this case you may have to build from source. See the [short section
-about this in the README](../README.md#a-note-on-linux-binaries-and-glibc-version).
+about this in the usage guide](USAGE.md#a-note-on-linux-binaries-and-glibc-version).
 
 For every file available on the website, there is an accompanying `.asc` file with the same
 name on our [Github release page](https://github.com/wizardsardine/liana/releases).
@@ -148,8 +148,8 @@ Click on continue until we finalize the installation.
 ## Step 2: have fun
 
 Once synchronized, Liana will open the wallet.
-You can generate a receive address in the "Receive" menu. You can get signet coins from the signet
-faucet at https://signet.bc-2.jp/.
+You can generate a receive address in the "Receive" menu. You can get signet coins from a public signet
+faucet.
 
 If you want to try the timelocked recovery path, receive some coins and wait for some blocks (2 for
 my own configuration, but it depends on what you configured previously). Then you can click on
