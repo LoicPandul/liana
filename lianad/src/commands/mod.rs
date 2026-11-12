@@ -217,6 +217,7 @@ fn coin_to_candidate(
     must_select: bool,
     sequence: Option<bitcoin::Sequence>,
     ancestor_info: Option<AncestorInfo>,
+    remaining_sequence: Option<u32>,
 ) -> CandidateCoin {
     CandidateCoin {
         outpoint: coin.outpoint,
@@ -226,7 +227,7 @@ fn coin_to_candidate(
         must_select,
         sequence,
         ancestor_info,
-        remaining_sequence: None,
+        remaining_sequence,
     }
 }
 
@@ -678,6 +679,9 @@ impl DaemonControl {
         // the spend from a set of optional candidates.
         // Otherwise, only the specified coins will be used, all as mandatory candidates.
         let candidate_coins: Vec<CandidateCoin> = if coins_outpoints.is_empty() {
+            // The coins' heights come from the database, so does the tip.
+            let tip_height = db_conn.chain_tip().map(|tip| tip.height);
+            let timelock: i32 = self.config.main_descriptor.first_timelock_value().into();
             // From our unconfirmed coins, we only include those that are from self
             // since unconfirmed external deposits are more at risk of being dropped
             // unexpectedly from the mempool as they are beyond the user's control.
@@ -709,11 +713,18 @@ impl DaemonControl {
                     }
                 })
                 .map(|(c, ancestor_info)| {
+                    let remaining_sequence = c.block_info.zip(tip_height).map(|(b, tip_height)| {
+                        (b.height + timelock - tip_height)
+                            .max(0)
+                            .try_into()
+                            .expect("non-negative and fits in u32")
+                    });
                     coin_to_candidate(
                         &c,
                         /*must_select=*/ false,
                         /*sequence=*/ None,
                         ancestor_info,
+                        remaining_sequence,
                     )
                 })
                 .collect()
@@ -755,6 +766,7 @@ impl DaemonControl {
                         /*must_select=*/ true,
                         /*sequence=*/ None,
                         ancestor_info,
+                        /*remaining_sequence=*/ None,
                     )
                 })
                 .collect()
@@ -1186,7 +1198,7 @@ impl DaemonControl {
                 // when including these coins in the previous transaction.
                 coin_to_candidate(
                     c, /*must_select=*/ !is_cancel, /*sequence=*/ None,
-                    /*ancestor_info=*/ None,
+                    /*ancestor_info=*/ None, /*remaining_sequence=*/ None,
                 )
             })
             .collect();
@@ -1199,7 +1211,7 @@ impl DaemonControl {
                 if !prev_coins.contains_key(&c.outpoint) {
                     Some(coin_to_candidate(
                         &c, /*must_select=*/ false, /*sequence=*/ None,
-                        /*ancestor_info=*/ None,
+                        /*ancestor_info=*/ None, /*remaining_sequence=*/ None,
                     ))
                 } else {
                     None
@@ -1388,6 +1400,7 @@ impl DaemonControl {
                     /*must_select=*/ true,
                     /*sequence=*/ Some(bitcoin::Sequence::from_height(timelock)),
                     /*ancestor_info=*/ None,
+                    /*remaining_sequence=*/ None,
                 ));
             } else if !coins_outpoints.is_empty() {
                 return Err(CommandError::OutpointNotRecoverable(op, timelock));
@@ -2678,6 +2691,77 @@ mod tests {
             Err(CommandError::ImmatureCoinbase(imma_op))
         );
 
+        ms.shutdown();
+    }
+
+    #[test]
+    fn create_spend_prefers_coins_closer_to_expiry() {
+        let ms = DummyLiana::new_timelock(DummyBitcoind::new(), 200);
+        let control = &ms.control();
+        let mut db_conn = control.db().lock().unwrap().connection();
+        db_conn.update_tip(&crate::bitcoin::BlockChainTip {
+            hash: bitcoin::BlockHash::from_str(
+                "000000007bc154e0fa7ea32218a72fe2c1bb9f86cf8c9ebf9a715ed27fdb229a",
+            )
+            .unwrap(),
+            height: 100,
+        });
+        let dummy_tx = bitcoin::Transaction {
+            version: TxVersion::TWO,
+            lock_time: absolute::LockTime::Blocks(absolute::Height::ZERO),
+            input: vec![],
+            output: vec![],
+        };
+        db_conn.new_txs(&[dummy_tx.clone()]);
+        let confirmed_coin = |vout: u32, height: i32, amount_sat: u64| Coin {
+            outpoint: bitcoin::OutPoint::new(dummy_tx.compute_txid(), vout),
+            is_immature: false,
+            block_info: Some(BlockInfo {
+                height,
+                time: 1_000,
+            }),
+            amount: bitcoin::Amount::from_sat(amount_sat),
+            derivation_index: bip32::ChildNumber::from(vout),
+            is_change: false,
+            spend_txid: None,
+            spend_block: None,
+            is_from_self: false,
+        };
+        // Either coin pays on its own, at the same fee. The younger one is worth more, which is
+        // what the coin selection would otherwise pick.
+        let young = confirmed_coin(0, 99, 2_000_000);
+        let old = confirmed_coin(1, 10, 1_000_000);
+        db_conn.new_unspent_coins(&[young, old]);
+        let dummy_addr =
+            bitcoin::Address::from_str("bc1qnsexk3gnuyayu92fc3tczvc7k62u22a22ua2kv").unwrap();
+        let destinations: HashMap<bitcoin::Address<address::NetworkUnchecked>, u64> =
+            [(dummy_addr, 500_000)].iter().cloned().collect();
+        let psbt = if let CreateSpendResult::Success { psbt, .. } =
+            control.create_spend(&destinations, &[], 2, None).unwrap()
+        {
+            psbt
+        } else {
+            panic!("expect successful spend creation")
+        };
+        let inputs: Vec<_> = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|txin| txin.previous_output)
+            .collect();
+        assert_eq!(inputs, vec![old.outpoint]);
+
+        // Coins picked by the user are kept as they are.
+        let psbt = if let CreateSpendResult::Success { psbt, .. } = control
+            .create_spend(&destinations, &[young.outpoint], 2, None)
+            .unwrap()
+        {
+            psbt
+        } else {
+            panic!("expect successful spend creation")
+        };
+        assert_eq!(psbt.unsigned_tx.input.len(), 1);
+        assert_eq!(psbt.unsigned_tx.input[0].previous_output, young.outpoint);
         ms.shutdown();
     }
 
