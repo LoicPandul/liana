@@ -3,6 +3,7 @@
 use crate::descriptors;
 
 use std::{
+    cmp,
     collections::{BTreeMap, HashMap},
     convert::TryInto,
     fmt,
@@ -260,6 +261,9 @@ pub struct CandidateCoin {
     pub sequence: Option<bitcoin::Sequence>,
     /// Information about in-mempool ancestors of the coin.
     pub ancestor_info: Option<AncestorInfo>,
+    /// Number of blocks left before the first recovery path becomes available for this coin, if
+    /// known. Coin selection favours the coins closest to expiry, as spending them refreshes them.
+    pub remaining_sequence: Option<u32>,
 }
 
 /// A coin selection result.
@@ -307,6 +311,52 @@ impl bdk_coin_select::BnbMetric for LowestFeeChangeCondition {
 
     fn requires_ordering_by_descending_value_pwu(&self) -> bool {
         self.lowest_fee.requires_ordering_by_descending_value_pwu()
+    }
+}
+
+/// Swap selected coins for unselected ones closer to the expiry of their timelock, as long as the
+/// selection gets no heavier, hence no more expensive, and keeps its change output.
+///
+/// Mandatory coins are never swapped out, and a coin worth less than its input fee is never swapped in.
+fn prefer_coins_closer_to_expiry(
+    selector: &mut CoinSelector,
+    candidate_coins: &[CandidateCoin],
+    target: Target,
+    change_policy: ChangePolicy,
+) {
+    // A coin whose expiry is unknown, such as an unconfirmed one, counts as the furthest from it.
+    let remaining = |i: usize| candidate_coins[i].remaining_sequence.unwrap_or(u32::MAX);
+    // Not `unselected_indices()`, which skips the coins the branch and bound banned.
+    let mut older_coins: Vec<usize> = (0..candidate_coins.len())
+        .filter(|i| {
+            !selector.is_selected(*i)
+                && candidate_coins[*i].remaining_sequence.is_some()
+                && selector.candidate(*i).effective_value(target.fee.rate) > 0.0
+        })
+        .collect();
+    older_coins.sort_by_key(|i| (remaining(*i), candidate_coins[*i].outpoint));
+    for older in older_coins {
+        let mut younger_coins: Vec<usize> = selector
+            .selected_indices()
+            .iter()
+            .copied()
+            .filter(|i| {
+                !candidate_coins[*i].must_select
+                    && remaining(*i) > remaining(older)
+                    && selector.candidate(*i).weight >= selector.candidate(older).weight
+            })
+            .collect();
+        younger_coins.sort_by_key(|i| (cmp::Reverse(remaining(*i)), candidate_coins[*i].outpoint));
+        for younger in younger_coins {
+            selector.deselect(younger);
+            selector.select(older);
+            let drain = selector.drain(target, change_policy);
+            if drain.is_some() && selector.is_target_met_with_drain(target, drain) {
+                break;
+            }
+            selector.deselect(older);
+            selector.select(younger);
+        }
     }
 }
 
@@ -493,6 +543,11 @@ fn select_coins_for_spend(
                 return Err(InsufficientFunds { missing });
             }
         }
+    }
+    // With a change output, selections of the same weight pay the same fee: among them, spend the
+    // coins closest to expiry, which postpones the next refresh the most.
+    if selector.drain(target, change_policy).is_some() {
+        prefer_coins_closer_to_expiry(&mut selector, candidate_coins, target, change_policy);
     }
     // By now, selection is complete and we can check how much change to give according to our policy.
     let drain = selector.drain(target, change_policy);
@@ -881,9 +936,130 @@ pub fn create_spend(
 mod tests {
     use super::*;
 
-    use std::time::Duration;
+    use std::{str::FromStr, time::Duration};
 
     use miniscript::bitcoin::absolute::{Height, LockTime};
+
+    /// Satisfaction weight of an input, close to the one of a Liana descriptor's primary path.
+    const MAX_SAT_WEIGHT: u64 = 250;
+    const PAYMENT_SAT: u64 = 2_000_000;
+
+    fn candidate(vout: u32, amount_sat: u64, remaining_sequence: Option<u32>) -> CandidateCoin {
+        CandidateCoin {
+            outpoint: bitcoin::OutPoint::from_str(&format!(
+                "{}:{}",
+                "0000000000000000000000000000000000000000000000000000000000000001", vout
+            ))
+            .unwrap(),
+            amount: bitcoin::Amount::from_sat(amount_sat),
+            deriv_index: bip32::ChildNumber::from_normal_idx(vout).unwrap(),
+            is_change: false,
+            must_select: false,
+            sequence: None,
+            ancestor_info: None,
+            remaining_sequence,
+        }
+    }
+
+    fn p2wsh_txout(value_sat: u64) -> bitcoin::TxOut {
+        bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(value_sat),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes([&[0x00, 0x20][..], &[1; 32]].concat()),
+        }
+    }
+
+    /// Select coins for a single payment of [`PAYMENT_SAT`].
+    fn select_for_payment(candidates: &[CandidateCoin], feerate_vb: f32) -> CoinSelectionRes {
+        let base_tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![p2wsh_txout(PAYMENT_SAT)],
+        };
+        select_coins_for_spend(
+            candidates,
+            base_tx,
+            p2wsh_txout(u64::MAX),
+            feerate_vb,
+            None,
+            MAX_SAT_WEIGHT,
+            false,
+        )
+        .unwrap()
+    }
+
+    fn selected_vouts(res: &CoinSelectionRes) -> Vec<u32> {
+        let mut vouts: Vec<u32> = res.selected.iter().map(|c| c.outpoint.vout).collect();
+        vouts.sort();
+        vouts
+    }
+
+    fn fee_sat(res: &CoinSelectionRes) -> u64 {
+        res.selected.iter().map(|c| c.amount.to_sat()).sum::<u64>()
+            - PAYMENT_SAT
+            - res.change_amount.to_sat()
+    }
+
+    #[test]
+    fn coin_selection_prefers_coins_closer_to_expiry_at_same_fee() {
+        let coins = [
+            candidate(0, 50_000_000, Some(900)),
+            candidate(1, 8_000_000, Some(700)),
+            candidate(2, 3_000_000, Some(300)),
+            candidate(3, 1_200_000, Some(250)),
+            // An unconfirmed coin: its expiry is unknown.
+            candidate(4, 100_000_000, None),
+        ];
+        let no_expiry: Vec<CandidateCoin> = coins
+            .iter()
+            .map(|c| CandidateCoin {
+                remaining_sequence: None,
+                ..*c
+            })
+            .collect();
+        for feerate_vb in [2.0, 20.0] {
+            let without = select_for_payment(&no_expiry, feerate_vb);
+            let with = select_for_payment(&coins, feerate_vb);
+            // The oldest coin that covers the payment on its own, at the same fee.
+            assert_eq!(selected_vouts(&with), vec![2]);
+            assert_eq!(with.selected.len(), without.selected.len());
+            assert_eq!(fee_sat(&with), fee_sat(&without));
+            assert!(with.change_amount.to_sat() > 0);
+        }
+    }
+
+    #[test]
+    fn coin_selection_swaps_in_coins_banned_by_bnb() {
+        let coins = [
+            candidate(0, 3_000_000, Some(682)),
+            candidate(1, 3_100_000, Some(412)),
+            candidate(2, 3_200_000, Some(264)),
+        ];
+        for feerate_vb in [2.0, 20.0] {
+            let res = select_for_payment(&coins, feerate_vb);
+            assert_eq!(selected_vouts(&res), vec![2]);
+        }
+    }
+
+    #[test]
+    fn coin_selection_never_swaps_out_mandatory_coins() {
+        let mut young = candidate(0, 50_000_000, Some(900));
+        young.must_select = true;
+        let coins = [young, candidate(1, 3_000_000, Some(300))];
+        let res = select_for_payment(&coins, 2.0);
+        assert_eq!(selected_vouts(&res), vec![0]);
+    }
+
+    #[test]
+    fn coin_selection_keeps_a_changeless_solution() {
+        // Pays the payment and its fee with an excess too small for a change output.
+        let exact = candidate(0, PAYMENT_SAT + 600, Some(900));
+        let res = select_for_payment(&[exact], 2.0);
+        assert_eq!(res.change_amount.to_sat(), 0);
+        let res = select_for_payment(&[exact, candidate(1, 3_000_000, Some(300))], 2.0);
+        assert_eq!(selected_vouts(&res), vec![0]);
+        assert_eq!(res.change_amount.to_sat(), 0);
+    }
 
     #[test]
     fn test_anti_fee_sniping_locktime() {

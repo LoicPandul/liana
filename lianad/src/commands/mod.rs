@@ -226,6 +226,7 @@ fn coin_to_candidate(
         must_select,
         sequence,
         ancestor_info,
+        remaining_sequence: None,
     }
 }
 
