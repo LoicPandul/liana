@@ -99,6 +99,10 @@ pub const DUST_OUTPUT_SATS: u64 = 500;
 /// Long-term feerate (sats/vb) used for coin selection considerations.
 pub const LONG_TERM_FEERATE_VB: f32 = 5.0;
 
+/// Maximum number of coins added to a transaction only to refresh them, so a wallet with many
+/// expiring coins refreshes them over several transactions rather than in a single large one.
+pub const MAX_REFRESH_INPUTS: usize = 5;
+
 /// Assume that paying more than 1BTC in fee is a bug.
 pub const MAX_FEE: bitcoin::Amount = bitcoin::Amount::ONE_BTC;
 
@@ -314,6 +318,22 @@ impl bdk_coin_select::BnbMetric for LowestFeeChangeCondition {
     }
 }
 
+/// Whether refreshing a coin now costs less than refreshing it later, so that it is worth adding to
+/// the transaction for this purpose alone.
+///
+/// The cost of a later refresh is the cost of spending the coin at [`LONG_TERM_FEERATE_VB`],
+/// weighted by `(window / remaining_sequence)²` up to 1, where the window is the last 10% of the
+/// timelock, in which the GUI warns about the coin. So a coin in the window is added at up to the
+/// long-term feerate, and a coin further from expiry only at a lower feerate.
+fn is_refresh_due(remaining_sequence: u32, timelock: u16, feerate_vb: f32) -> bool {
+    let window = f64::from(timelock) * 10.0 / 100.0;
+    let remaining = f64::from(remaining_sequence);
+    let feerate_vb = f64::from(feerate_vb);
+    let long_term_feerate_vb = f64::from(LONG_TERM_FEERATE_VB);
+    feerate_vb <= long_term_feerate_vb
+        && remaining * remaining * feerate_vb <= window * window * long_term_feerate_vb
+}
+
 /// Swap selected coins for unselected ones closer to the expiry of their timelock, as long as the
 /// selection gets no heavier, hence no more expensive, and keeps its change output.
 ///
@@ -385,6 +405,10 @@ fn prefer_coins_closer_to_expiry(
 ///
 /// `must_have_change` indicates whether the transaction must have a change output.
 /// If `true`, the returned change amount will be positive.
+///
+/// `timelock` is the value (in blocks) of the first recovery path's relative timelock. Optional
+/// candidates whose refresh is due are selected first, see [`is_refresh_due`].
+#[allow(clippy::too_many_arguments)]
 fn select_coins_for_spend(
     candidate_coins: &[CandidateCoin],
     base_tx: bitcoin::Transaction,
@@ -393,6 +417,7 @@ fn select_coins_for_spend(
     replaced_fee: Option<u64>,
     max_sat_weight: u64,
     must_have_change: bool,
+    timelock: u16,
 ) -> Result<CoinSelectionRes, InsufficientFunds> {
     let out_value_nochange = base_tx.output.iter().map(|o| o.value.to_sat()).sum();
     let out_weight_nochange = {
@@ -459,11 +484,33 @@ fn select_coins_for_spend(
             selector.select(i);
         }
     }
+    let feerate = FeeRate::from_sat_per_vb(feerate_vb);
+    // A coin worth less than its input fee is not worth refreshing.
+    let mut refresh_due: Vec<usize> = candidate_coins
+        .iter()
+        .enumerate()
+        .filter(|(i, cand)| {
+            !cand.must_select
+                && cand
+                    .remaining_sequence
+                    .is_some_and(|rem| is_refresh_due(rem, timelock, feerate_vb))
+                && candidates[*i].effective_value(feerate) > 0.0
+        })
+        .map(|(i, _)| i)
+        .collect();
+    refresh_due.sort_by_key(|i| {
+        (
+            candidate_coins[*i].remaining_sequence,
+            candidate_coins[*i].outpoint,
+        )
+    });
+    for i in refresh_due.into_iter().take(MAX_REFRESH_INPUTS) {
+        selector.select(i);
+    }
 
     // Now set the change policy. We use a policy which ensures no change output is created with a
     // lower value than our custom dust limit. NOTE: the change output weight must not account for
     // a potential difference in the size of the outputs count varint.
-    let feerate = FeeRate::from_sat_per_vb(feerate_vb);
     let long_term_feerate = FeeRate::from_sat_per_vb(LONG_TERM_FEERATE_VB);
     let change_output_weight = change_txo.weight().to_wu();
     let drain_weights = DrainWeights {
@@ -846,6 +893,7 @@ pub fn create_spend(
             replaced_fee,
             max_sat_wu,
             is_self_send,
+            main_descriptor.first_timelock_value(),
         )
         .map_err(SpendCreationError::CoinSelection)?
     };
@@ -943,6 +991,8 @@ mod tests {
     /// Satisfaction weight of an input, close to the one of a Liana descriptor's primary path.
     const MAX_SAT_WEIGHT: u64 = 250;
     const PAYMENT_SAT: u64 = 2_000_000;
+    /// The coins in its last 100 blocks are in the GUI's warning window.
+    const TIMELOCK: u16 = 1_000;
 
     fn candidate(vout: u32, amount_sat: u64, remaining_sequence: Option<u32>) -> CandidateCoin {
         CandidateCoin {
@@ -984,6 +1034,7 @@ mod tests {
             None,
             MAX_SAT_WEIGHT,
             false,
+            TIMELOCK,
         )
         .unwrap()
     }
@@ -1039,6 +1090,39 @@ mod tests {
             let res = select_for_payment(&coins, feerate_vb);
             assert_eq!(selected_vouts(&res), vec![2]);
         }
+    }
+
+    #[test]
+    fn coin_selection_refreshes_coins_close_to_expiry_at_low_feerate() {
+        let coins = [
+            candidate(0, 50_000_000, Some(900)),
+            // Expired.
+            candidate(1, 100_000, Some(0)),
+            // In the warning window.
+            candidate(2, 100_000, Some(100)),
+            // Twice the window: only worth refreshing below a quarter of the long-term feerate.
+            candidate(3, 100_000, Some(200)),
+            // Worth less than its input fee.
+            candidate(4, 100, Some(0)),
+            // Unconfirmed.
+            candidate(5, 100_000, None),
+        ];
+        for (feerate_vb, expected) in [
+            (1.0, vec![0, 1, 2, 3]),
+            (2.0, vec![0, 1, 2]),
+            (5.0, vec![0, 1, 2]),
+            // Above the long-term feerate, a later refresh is expected to be cheaper.
+            (6.0, vec![0]),
+        ] {
+            let res = select_for_payment(&coins, feerate_vb);
+            assert_eq!(selected_vouts(&res), expected, "feerate {feerate_vb}");
+        }
+
+        // At most `MAX_REFRESH_INPUTS` coins are added only to refresh them.
+        let mut coins = vec![candidate(0, 50_000_000, Some(900))];
+        coins.extend((1..=8).map(|vout| candidate(vout, 100_000, Some(vout))));
+        let res = select_for_payment(&coins, 2.0);
+        assert_eq!(selected_vouts(&res), vec![0, 1, 2, 3, 4, 5]);
     }
 
     #[test]

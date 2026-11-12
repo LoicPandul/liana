@@ -234,7 +234,10 @@ Create a transaction spending one or more of our coins. All coins must exist and
 
 If no coins are specified in `outpoints`, they will be selected automatically from the set of
 confirmed coins together with any unconfirmed coins that are change outputs
-(see [`listcoins`](#listcoins) for coin status definitions).
+(see [`listcoins`](#listcoins) for coin status definitions). Among selections paying the same fee,
+the one spending coins closest to the expiry of their timelocked recovery path is preferred. At a
+feerate no higher than 5 sat/vb, up to 5 coins whose recovery path is available or about to become
+available are also added, to refresh them.
 
 Will error if the given coins are not sufficient to cover the transaction cost at 90% (or more) of
 the given feerate. If on the contrary the transaction is more than sufficiently funded, it will
